@@ -49,22 +49,30 @@ __device__ void sha256_init(sha256_ctx* c) {
 }
 
 __device__ void sha256_transform(u32 h[8], const u8 block[64]) {
-    u32 w[64];
+    // 16-word rolling message schedule: w[(i)&15] holds w[i-16] until overwritten,
+    // so only 16 words are kept live (vs 64), cutting per-thread register/local
+    // memory pressure. With #pragma unroll the (i&15) indices fold to constants.
+    u32 w[16];
     #pragma unroll
     for (int i = 0; i < 16; i++)
         w[i] = ((u32)block[i*4]<<24)|((u32)block[i*4+1]<<16)|((u32)block[i*4+2]<<8)|((u32)block[i*4+3]);
-    #pragma unroll
-    for (int i = 16; i < 64; i++) {
-        u32 s0 = rotr32(w[i-15],7) ^ rotr32(w[i-15],18) ^ (w[i-15]>>3);
-        u32 s1 = rotr32(w[i-2],17) ^ rotr32(w[i-2],19) ^ (w[i-2]>>10);
-        w[i] = w[i-16] + s0 + w[i-7] + s1;
-    }
     u32 a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
     #pragma unroll
     for (int i = 0; i < 64; i++) {
+        u32 wi;
+        if (i < 16) {
+            wi = w[i & 15];
+        } else {
+            u32 w15 = w[(i+1) & 15];   // w[i-15]
+            u32 w2  = w[(i+14) & 15];  // w[i-2]
+            u32 s0 = rotr32(w15,7) ^ rotr32(w15,18) ^ (w15>>3);
+            u32 s1 = rotr32(w2,17) ^ rotr32(w2,19) ^ (w2>>10);
+            wi = w[i & 15] + s0 + w[(i+9) & 15] + s1; // w[i-16] + s0 + w[i-7] + s1
+            w[i & 15] = wi;
+        }
         u32 S1 = rotr32(e,6) ^ rotr32(e,11) ^ rotr32(e,25);
         u32 ch = (e & f) ^ ((~e) & g);
-        u32 t1 = hh + S1 + ch + K256[i] + w[i];
+        u32 t1 = hh + S1 + ch + K256[i] + wi;
         u32 S0 = rotr32(a,2) ^ rotr32(a,13) ^ rotr32(a,22);
         u32 maj = (a & b) ^ (a & c) ^ (b & c);
         u32 t2 = S0 + maj;
@@ -84,12 +92,19 @@ __device__ void sha256_update(sha256_ctx* c, const u8* data, u32 len) {
 }
 
 __device__ void sha256_final(sha256_ctx* c, u8 out[32]) {
+    // Pad directly in the context buffer (one or two block flushes) instead of
+    // streaming the padding one byte at a time through sha256_update.
     u64 bits = c->total * 8;
-    u8 pad = 0x80; sha256_update(c, &pad, 1);
-    u8 zero = 0; while (c->n != 56) sha256_update(c, &zero, 1);
-    u8 lenb[8];
-    for (int i = 0; i < 8; i++) lenb[7-i] = (u8)(bits >> (i*8));
-    sha256_update(c, lenb, 8);
+    u32 n = c->n;
+    c->buf[n++] = 0x80;
+    if (n > 56) {
+        while (n < 64) c->buf[n++] = 0;
+        sha256_transform(c->h, c->buf);
+        n = 0;
+    }
+    while (n < 56) c->buf[n++] = 0;
+    for (int i = 0; i < 8; i++) c->buf[56 + i] = (u8)(bits >> (56 - i*8)); // big-endian
+    sha256_transform(c->h, c->buf);
     for (int i = 0; i < 8; i++) {
         out[i*4]   = (u8)(c->h[i] >> 24);
         out[i*4+1] = (u8)(c->h[i] >> 16);
@@ -140,24 +155,33 @@ __device__ void sha512_init(sha512_ctx* c) {
 }
 
 __device__ void sha512_transform(u64 h[8], const u8 block[128]) {
-    u64 w[80];
+    // 16-word rolling message schedule (see sha256_transform): keeps only 16 of
+    // the 80 schedule words live, which is a big register/local-memory win for
+    // the 64-bit state — and SHA-512 is the hot primitive (PBKDF2 runs it 4096x
+    // per candidate).
+    u64 w[16];
     #pragma unroll
     for (int i = 0; i < 16; i++) {
-        w[i] = 0;
-        for (int j = 0; j < 8; j++) w[i] = (w[i] << 8) | block[i*8+j];
-    }
-    #pragma unroll
-    for (int i = 16; i < 80; i++) {
-        u64 s0 = rotr64(w[i-15],1) ^ rotr64(w[i-15],8) ^ (w[i-15]>>7);
-        u64 s1 = rotr64(w[i-2],19) ^ rotr64(w[i-2],61) ^ (w[i-2]>>6);
-        w[i] = w[i-16] + s0 + w[i-7] + s1;
+        w[i] = ((u64)block[i*8]<<56)|((u64)block[i*8+1]<<48)|((u64)block[i*8+2]<<40)|((u64)block[i*8+3]<<32)
+             |((u64)block[i*8+4]<<24)|((u64)block[i*8+5]<<16)|((u64)block[i*8+6]<<8)|((u64)block[i*8+7]);
     }
     u64 a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
     #pragma unroll
     for (int i = 0; i < 80; i++) {
+        u64 wi;
+        if (i < 16) {
+            wi = w[i & 15];
+        } else {
+            u64 w15 = w[(i+1) & 15];   // w[i-15]
+            u64 w2  = w[(i+14) & 15];  // w[i-2]
+            u64 s0 = rotr64(w15,1) ^ rotr64(w15,8) ^ (w15>>7);
+            u64 s1 = rotr64(w2,19) ^ rotr64(w2,61) ^ (w2>>6);
+            wi = w[i & 15] + s0 + w[(i+9) & 15] + s1; // w[i-16] + s0 + w[i-7] + s1
+            w[i & 15] = wi;
+        }
         u64 S1 = rotr64(e,14) ^ rotr64(e,18) ^ rotr64(e,41);
         u64 ch = (e & f) ^ ((~e) & g);
-        u64 t1 = hh + S1 + ch + K512[i] + w[i];
+        u64 t1 = hh + S1 + ch + K512[i] + wi;
         u64 S0 = rotr64(a,28) ^ rotr64(a,34) ^ rotr64(a,39);
         u64 maj = (a & b) ^ (a & c) ^ (b & c);
         u64 t2 = S0 + maj;
@@ -179,13 +203,21 @@ __device__ void sha512_update(sha512_ctx* c, const u8* data, u32 len) {
 __device__ void sha512_final(sha512_ctx* c, u8 out[64]) {
     // We only ever hash messages well under 2^64 bytes, so the high 64 bits of
     // the 128-bit length field are always zero.
+    // Pad directly in the context buffer instead of streaming padding byte-by-byte.
     u64 bits = c->total * 8;
-    u8 pad = 0x80; sha512_update(c, &pad, 1);
-    u8 zero = 0; while (c->n != 112) sha512_update(c, &zero, 1);
-    u8 lenb[16];
-    for (int i = 0; i < 8; i++) lenb[i] = 0;
-    for (int i = 0; i < 8; i++) lenb[15-i] = (u8)(bits >> (i*8));
-    sha512_update(c, lenb, 16);
+    u32 n = c->n;
+    c->buf[n++] = 0x80;
+    if (n > 112) {
+        while (n < 128) c->buf[n++] = 0;
+        sha512_transform(c->h, c->buf);
+        n = 0;
+    }
+    while (n < 112) c->buf[n++] = 0;
+    // 128-bit length: high 64 bits are always zero (messages are tiny), low 64
+    // bits big-endian.
+    for (int i = 0; i < 8; i++) c->buf[112 + i] = 0;
+    for (int i = 0; i < 8; i++) c->buf[120 + i] = (u8)(bits >> (56 - i*8));
+    sha512_transform(c->h, c->buf);
     for (int i = 0; i < 8; i++)
         for (int j = 0; j < 8; j++) out[i*8+j] = (u8)(c->h[i] >> (56 - j*8));
 }
