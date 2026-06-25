@@ -270,7 +270,7 @@ fn run_tokenlist_search_gpu(
 
     let mut total_checked: usize = 0;
 
-    'outer: for slot_count in min_token..=max_token {
+    for slot_count in min_token..=max_token {
         let slot_indices: Vec<usize> = (0..slots.len()).collect();
 
         for chosen_slot_indices in slot_indices.iter().copied().combinations(slot_count) {
@@ -354,7 +354,7 @@ fn run_tokenlist_search_gpu(
         }
     }
 
-    let _ = &'outer; // suppress "unused label" warning if we never break it.
+     // suppress "unused label" warning if we never break it.
     Ok(false)
 }
 
