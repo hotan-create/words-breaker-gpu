@@ -131,13 +131,29 @@ fn main() -> Result<()> {
     let found = if let Some(ref tokenlist_path) = args.tokenlist {
         // ── tokenlist mode ──────────────────────────────────────────────────
         let slots = parse_tokenlist(tokenlist_path)?;
-        run_tokenlist_search(&args, &slots, &target_address, language)?
+
+        if args.cpu {
+            println!("--cpu flag set: forcing CPU for tokenlist search.");
+            run_tokenlist_search_cpu(&args, &slots, &target_address, language)?
+        } else {
+            // Try GPU first; fall back to CPU on failure
+            match run_tokenlist_search_gpu(&args, &slots, &target_address, language) {
+                Ok(found) => found,
+                Err(e) => {
+                    eprintln!(
+                        "GPU tokenlist search unavailable ({e:#}); falling back to CPU."
+                    );
+                    run_tokenlist_search_cpu(&args, &slots, &target_address, language)?
+                }
+            }
+        }
     } else {
         // ── classic words mode ───────────────────────────────────────────────
         if !(10..=12).contains(&args.words.len()) {
             anyhow::bail!("Expected 10, 11, or 12 words, got {}", args.words.len());
         }
         if args.cpu {
+            println!("--cpu flag set: forcing CPU for word search.");
             run_cpu_search(&args, &target_address, language)?
         } else {
             match search_permutations_gpu(&args.words, &target_address, language) {
@@ -219,19 +235,134 @@ fn parse_tokenlist(path: &PathBuf) -> Result<Vec<Slot>> {
 }
 
 // ---------------------------------------------------------------------------
-// Tokenlist search orchestration
+// GPU tokenlist search
 // ---------------------------------------------------------------------------
 
-/// Entry point for tokenlist-mode search.
+/// Tokenlist search using GPU.
 ///
-/// Strategy:
-/// 1. Determine which subset of slots to use (min_token..=total_slots).
-/// 2. For each subset combination, pick one alternative per slot (Cartesian
-///    product across slots).
-/// 3. Flatten the chosen alternatives into a word list.
-/// 4. Unless --keep-token-order, permute the word list.
-/// 5. Try the resulting phrase against the target address.
-fn run_tokenlist_search(
+/// Strategy: flatten each Cartesian-product combination into a flat word list,
+/// then — for permuted mode — hand each permuted batch to the GPU as a
+/// `candidates::stream` so the GPU can check all 12-word phrases.
+///
+/// When `keep_token_order` is set, missing-word insertion positions are still
+/// permuted on the CPU (cheap), but the GPU handles the crypto.
+fn run_tokenlist_search_gpu(
+    args: &Args,
+    slots: &[Slot],
+    target: &Address<NetworkChecked>,
+    language: Language,
+) -> Result<bool> {
+    // Initialise GPU once and reuse across all sub-searches.
+    let gpu = gpu::Gpu::new()?;
+    println!("Using GPU (CUDA) for tokenlist search.");
+
+    let wordlist: &'static [&'static str] = language.words_by_prefix("");
+    let gpu_wordlist = gpu::GpuWordlist::new(wordlist)?;
+    let target_h160 = p2pkh_hash160(target)?;
+    let batch_size = 1 << 20;
+
+    let min_token = args.min_token.unwrap_or(slots.len()).min(slots.len());
+    let max_token = slots.len();
+    println!(
+        "Trying slot subsets of size {}..={} (--min-token={}).",
+        min_token, max_token, min_token
+    );
+
+    let mut total_checked: usize = 0;
+
+    'outer: for slot_count in min_token..=max_token {
+        let slot_indices: Vec<usize> = (0..slots.len()).collect();
+
+        for chosen_slot_indices in slot_indices.iter().copied().combinations(slot_count) {
+            let chosen_slots: Vec<&Slot> =
+                chosen_slot_indices.iter().map(|&i| &slots[i]).collect();
+
+            // Cartesian product over alternatives for this slot combination.
+            for words in cartesian_product_slots(&chosen_slots) {
+                let word_count = words.len();
+                if word_count > 12 || word_count < 10 {
+                    continue;
+                }
+                let missing = 12 - word_count;
+
+                // Resolve word indices in the BIP-39 wordlist.
+                let mut known_idx: Vec<u16> = Vec::with_capacity(word_count);
+                let mut all_valid = true;
+                for w in &words {
+                    match wordlist.iter().position(|x| *x == w.as_str()) {
+                        Some(pos) => known_idx.push(pos as u16),
+                        None => {
+                            eprintln!("Warning: word '{w}' not in BIP-39 wordlist — skipping combination.");
+                            all_valid = false;
+                            break;
+                        }
+                    }
+                }
+                if !all_valid {
+                    continue;
+                }
+
+                if args.keep_token_order {
+                    // ── keep order: GPU handles missing-word search ──────────
+                    // Feed the fixed ordered base directly through GPU candidate stream.
+                    let cands = candidates::stream_with_base(known_idx, wordlist.len(), missing);
+                    if let Some(hit) =
+                        gpu.search(cands, &gpu_wordlist, &target_h160, batch_size)?
+                    {
+                        let phrase: Vec<&str> =
+                            hit.indices.iter().map(|&i| wordlist[i as usize]).collect();
+                        let phrase = phrase.join(" ");
+                        println!("Found matching mnemonic: {}", phrase);
+                        println!("Candidate index (0-based): {}", hit.global_index);
+                        println!("Derived address: {}", target);
+                        return Ok(true);
+                    }
+                    total_checked += candidates::count_with_base(word_count, wordlist.len(), missing);
+                } else {
+                    // ── permuted: iterate permutations on CPU, GPU per permutation ──
+                    let n = word_count;
+                    let perms: Vec<Vec<u16>> =
+                        known_idx.iter().copied().permutations(n).collect();
+
+                    for perm in perms {
+                        let cands =
+                            candidates::stream_with_base(perm, wordlist.len(), missing);
+                        if let Some(hit) =
+                            gpu.search(cands, &gpu_wordlist, &target_h160, batch_size)?
+                        {
+                            let phrase: Vec<&str> =
+                                hit.indices.iter().map(|&i| wordlist[i as usize]).collect();
+                            let phrase = phrase.join(" ");
+                            println!("Found matching mnemonic: {}", phrase);
+                            println!("Candidate index (0-based): {}", hit.global_index);
+                            println!("Derived address: {}", target);
+                            return Ok(true);
+                        }
+                        total_checked +=
+                            candidates::count_with_base(word_count, wordlist.len(), missing);
+
+                        if total_checked % 10_000_000 < batch_size {
+                            println!("Checked ~{} candidates...", format_number(total_checked));
+                            let _ = io::stdout().flush();
+                        }
+                    }
+                }
+            }
+
+            // Break outer early once all slot-combos at this level are done.
+            // (The 'outer label handles early-exit when a match is found above.)
+        }
+    }
+
+    let _ = &'outer; // suppress "unused label" warning if we never break it.
+    Ok(false)
+}
+
+// ---------------------------------------------------------------------------
+// CPU tokenlist search (renamed from original run_tokenlist_search)
+// ---------------------------------------------------------------------------
+
+fn run_tokenlist_search_cpu(
     args: &Args,
     slots: &[Slot],
     target: &Address<NetworkChecked>,
@@ -250,8 +381,6 @@ fn run_tokenlist_search(
     let min_token = args.min_token.unwrap_or(slots.len()).min(slots.len());
     let max_token = slots.len();
 
-    // Validate that at least one slot-count can produce valid phrase lengths.
-    // (We do this lazily per phrase below, but a quick heads-up is useful.)
     println!(
         "Trying slot subsets of size {}..={} (--min-token={}).",
         min_token, max_token, min_token
@@ -267,13 +396,11 @@ fn run_tokenlist_search(
     let found_phrase = Arc::new(std::sync::Mutex::new(String::new()));
     let found_index = Arc::new(AtomicUsize::new(0));
 
-    // Iterate over every valid subset size (min_token..=max_token).
     'outer: for slot_count in min_token..=max_token {
         if found.load(Ordering::Relaxed) {
             break;
         }
 
-        // Generate every combination of `slot_count` slots from the full list.
         let slot_indices: Vec<usize> = (0..slots.len()).collect();
 
         for chosen_slot_indices in slot_indices.iter().copied().combinations(slot_count) {
@@ -284,8 +411,6 @@ fn run_tokenlist_search(
             let chosen_slots: Vec<&Slot> =
                 chosen_slot_indices.iter().map(|&i| &slots[i]).collect();
 
-            // Build the stream of word-lists via Cartesian product over alternatives.
-            // Each element is a flat Vec<String> of all words from the chosen alts.
             let phrase_words_iter = cartesian_product_slots(&chosen_slots);
 
             phrase_words_iter
@@ -295,28 +420,22 @@ fn run_tokenlist_search(
                         return;
                     }
 
-                    // Determine how many BIP-39 words are missing.
                     let word_count = words.len();
                     if word_count > 12 {
-                        // Too many words — skip.
                         return;
                     }
                     let missing = 12 - word_count;
                     if word_count < 10 {
-                        // Not enough words even with missing-fill — skip.
                         return;
                     }
 
-                    // Produce candidate phrases (with or without permutation).
                     let candidates: Box<dyn Iterator<Item = String> + Send> =
                         if args.keep_token_order {
-                            // Keep order: only vary the missing-word insertion positions.
                             Box::new(
                                 insert_missing(words, missing, wordlist)
                                     .map(|v| v.join(" ")),
                             )
                         } else {
-                            // Full permutation of all words + missing-word insertion.
                             let n = words.len();
                             Box::new(
                                 words
@@ -388,15 +507,13 @@ fn run_tokenlist_search(
     }
 }
 
-/// Generates the Cartesian product over a list of slots (each slot is a list
-/// of alternatives). Yields flat `Vec<String>` — one per combination — where
-/// each alternative's words are appended in order.
-///
-/// This is a lazy iterator: no allocation beyond the current combination.
+// ---------------------------------------------------------------------------
+// Cartesian-product helper (unchanged)
+// ---------------------------------------------------------------------------
+
 fn cartesian_product_slots<'a>(
     slots: &'a [&'a Slot],
 ) -> impl Iterator<Item = Vec<String>> + 'a {
-    // Build a Vec of Vec<&Alternative> then multi_cartesian_product.
     let alt_lists: Vec<&[Alternative]> = slots.iter().map(|s| s.as_slice()).collect();
 
     alt_lists
@@ -408,7 +525,7 @@ fn cartesian_product_slots<'a>(
 }
 
 // ---------------------------------------------------------------------------
-// Helpers reused from original code (unchanged)
+// Classic CPU / GPU search helpers (unchanged)
 // ---------------------------------------------------------------------------
 
 fn run_cpu_search(
