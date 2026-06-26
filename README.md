@@ -115,8 +115,6 @@ The tokenlist file is the core input. Each **line** represents one **slot** (one
 | **Wildcard** | `?` | Unknown word — searched from full BIP-39 wordlist |
 
 ### Example Tokenlist.txt
-
-```
 galaxy,meat,evil,faith
 oxygen,donor,?,donkey
 popular,friend,oval,venture
@@ -125,8 +123,10 @@ note : missing word is fixed order ( you can edit the tokenlist with mutual excl
 example 
 
 galaxy,meat,evil,faith
-?oxygen,donor,donkey oxygen,?,donor,donkey oxygen,donor,?,donkey oxygen,donor,donkey,?
+?,oxygen,donor,donkey oxygen,?,donor,donkey oxygen,donor,?,donkey oxygen,donor,donkey,?  ##sparate with space every token
 popular,friend,oval,venture
+
+``,
 ```
 
 Total words across chosen slots must equal **12** (standard BIP-39 mnemonic length).
@@ -143,13 +143,13 @@ Total words across chosen slots must equal **12** (standard BIP-39 mnemonic leng
 
 ### GPU search (auto-detect)
 
-./target/release/words-breaker 1At7z8J3t3JJiAqtBTyJuHdCMKx45HmyVp --tokenlist tokenlist.txt --min-token 3 --cpu
+./target/release/words-breaker 1At7z8J3t3JJiAqtBTyJuHdCMKx45HmyVp --tokenlist tokenlist.txt --min-token 3
 
 
 ### Fixed slot & word order (no permutations)
 
 ```bash
-./target/release/words-breaker 1At7z8J3t3JJiAqtBTyJuHdCMKx45HmyVp --tokenlist tokenlist.txt --min-token 3 --cpu --keep-token-order
+./target/release/words-breaker 1At7z8J3t3JJiAqtBTyJuHdCMKx45HmyVp --tokenlist tokenlist.txt --min-token 3 --keep-token-order
   --keep-word-order
 ```
 
