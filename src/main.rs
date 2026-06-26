@@ -6,7 +6,6 @@ use bitcoin::secp256k1::Secp256k1;
 use bitcoin::{Network, PublicKey};
 use clap::Parser;
 use itertools::Itertools;
-use rayon::iter::ParallelBridge;
 use rayon::prelude::*;
 use std::fs;
 use std::io::{self, Write};
@@ -18,80 +17,92 @@ use std::time::Instant;
 mod candidates;
 mod gpu;
 
+// ---------------------------------------------------------------------------
+// CLI
+// ---------------------------------------------------------------------------
+
 #[derive(Parser, Debug)]
 #[command(
-    about = "Try permutations of BIP-39 words (10-12) to match a BTC legacy address. \
-             Words can be supplied directly or via --tokenlist. \
-             Missing words (when fewer than 12 are given) are filled from the 2048-word BIP-39 list.",
+    about = "Try permutations of BIP-39 words / token slots to match a BTC legacy address.",
     version
 )]
 struct Args {
-    /// Target legacy Bitcoin address (Base58, starting with '1').
+    /// Target legacy Bitcoin address (Base58, starts with '1').
     /// Optional only when --selftest is given.
     target_address: Option<String>,
-
-    /// 10, 11, or 12 words (unordered or partially ordered). Ignored when
-    /// --tokenlist is used.
-    words: Vec<String>,
-
-    /// Path to a tokenlist file.
-    ///
-    /// Format (one token-group per line):
-    ///   word1,word2,word3  alt1,alt2,alt3
-    ///
-    /// Each line defines one "slot" in the phrase. A slot contains one or more
-    /// SPACE-separated alternatives; exactly one alternative is chosen per slot
-    /// (mutual exclusion). An alternative is a COMMA-separated list of words
-    /// that are treated as a single ordered group.
-    ///
-    /// Example line:
-    ///   orbit,galaxy,venture,sun  orbit,galaxy,sun,venture
-    ///
-    /// This slot contributes either ["orbit","galaxy","venture","sun"] or
-    /// ["orbit","galaxy","sun","venture"] to the phrase — never both.
-    ///
-    /// The number of words across all chosen alternatives must total 12, or
-    /// equal 10/11 so that missing words are filled from the BIP-39 wordlist.
-    #[arg(long, value_name = "FILE")]
-    tokenlist: Option<PathBuf>,
-
-    /// When set, the words within each chosen alternative keep their original
-    /// order (no permutations). Without this flag every alternative is fully
-    /// permuted before being tested.
-    #[arg(long)]
-    keep_token_order: bool,
-
-    /// Minimum number of tokens (slots) to use from the tokenlist.
-    /// Slots beyond this minimum are optional and tried in combination.
-    /// Defaults to the total number of slots in the file.
-    #[arg(long, value_name = "N")]
-    min_token: Option<usize>,
 
     /// BIP-39 wordlist language
     #[arg(long, short, default_value = "english")]
     language: String,
 
-    /// Number of threads to use (defaults to number of CPU cores)
+    /// Path to a tokenlist file.
+    ///
+    /// FILE FORMAT
+    /// ===========
+    /// • One line = one SLOT (= one token).
+    /// • Blank lines and lines starting with '#' are ignored.
+    /// • Within a line, ALTERNATIVES are separated by whitespace.
+    ///   Exactly one alternative is chosen per slot.
+    /// • Within an alternative, WORDS are separated by commas.
+    /// • A bare '?' inside an alternative marks a MISSING word whose value
+    ///   is searched from the full BIP-39 wordlist — but ONLY within that slot.
+    ///
+    /// EXAMPLE (3 slots, total 3+2+2 = 7 known words + 1 missing in slot 1)
+    ///   zebra,liquid,tornado,?   <- slot 1: 3 words + 1 unknown
+    ///   orbit,galaxy             <- slot 2: 2 words
+    ///   venture,sun              <- slot 3: 2 words
+    ///
+    /// The total known+unknown word count across all chosen slots must equal 12
+    /// (BIP-39 mnemonic length).
+    #[arg(long, value_name = "FILE")]
+    tokenlist: Option<PathBuf>,
+
+    /// Keep SLOT order as written in the file (do not permute slots).
+    /// By default slots are permuted: 3 slots → 3! = 6 orderings tried.
+    #[arg(long)]
+    keep_token_order: bool,
+
+    /// Keep WORD order within each slot as written (do not permute words inside a slot).
+    /// By default words within a slot are permuted independently of other slots.
+    /// A '?' marker keeps its position when this flag is set.
+    #[arg(long)]
+    keep_word_order: bool,
+
+    /// Minimum number of slots to use from the tokenlist (default: all slots).
+    /// When set below the total, combinations of that many slots are tried.
+    #[arg(long, value_name = "N")]
+    min_token: Option<usize>,
+
+    /// Number of CPU threads (0 = all cores).
     #[arg(long, short, default_value_t = 0)]
     threads: usize,
 
-    /// Verify each GPU crypto primitive against the CPU reference and exit.
+    /// Verify GPU crypto primitives against CPU reference then exit.
     #[arg(long)]
     selftest: bool,
 
-    /// Force CPU (rayon) search instead of GPU.
+    /// Force CPU search (skip GPU even if available).
     #[arg(long)]
     cpu: bool,
 }
 
 // ---------------------------------------------------------------------------
-// Token-list types
+// Data model
 // ---------------------------------------------------------------------------
 
-/// One alternative within a slot: an ordered list of BIP-39 words.
-type Alternative = Vec<String>;
+/// A single token inside an alternative: either a concrete BIP-39 word or a
+/// wildcard `?` whose value is searched from the full wordlist.
+#[derive(Debug, Clone)]
+enum Token {
+    Word(String),
+    Missing,
+}
 
-/// One slot: a set of mutually-exclusive alternatives.
+/// One alternative = an ordered list of tokens (words / wildcards).
+type Alternative = Vec<Token>;
+
+/// One slot = a set of mutually-exclusive alternatives.
+/// Exactly one alternative is chosen per slot during the search.
 type Slot = Vec<Alternative>;
 
 // ---------------------------------------------------------------------------
@@ -117,63 +128,40 @@ fn main() -> Result<()> {
         .as_deref()
         .context("Missing target address")?;
 
-    let target_address_unchecked = target_address
+    let target: Address<NetworkChecked> = target_address
         .parse::<Address<NetworkUnchecked>>()
-        .context("Invalid target Bitcoin address")?;
-
-    let target_address: Address<NetworkChecked> = target_address_unchecked
+        .context("Invalid Bitcoin address")?
         .require_network(Network::Bitcoin.into())
-        .context("This tool currently only supports mainnet legacy addresses")?;
+        .context("Only mainnet legacy addresses are supported")?;
 
     let language = parse_language(&args.language)?;
     let start = Instant::now();
 
-    let found = if let Some(ref tokenlist_path) = args.tokenlist {
-        // ── tokenlist mode ──────────────────────────────────────────────────
-        let slots = parse_tokenlist(tokenlist_path)?;
+    let tokenlist_path = args
+        .tokenlist
+        .as_ref()
+        .context("--tokenlist is required (classic word mode not yet wired to new slot logic)")?;
 
-        if args.cpu {
-            println!("--cpu flag set: forcing CPU for tokenlist search.");
-            run_tokenlist_search_cpu(&args, &slots, &target_address, language)?
-        } else {
-            // Try GPU first; fall back to CPU on failure
-            match run_tokenlist_search_gpu(&args, &slots, &target_address, language) {
-                Ok(found) => found,
-                Err(e) => {
-                    eprintln!(
-                        "GPU tokenlist search unavailable ({e:#}); falling back to CPU."
-                    );
-                    run_tokenlist_search_cpu(&args, &slots, &target_address, language)?
-                }
-            }
-        }
+    let slots = parse_tokenlist(tokenlist_path)?;
+    validate_slots(&slots, &args, language)?;
+
+    let found = if args.cpu {
+        println!("--cpu flag set: using CPU.");
+        run_search_cpu(&args, &slots, &target, language)?
     } else {
-        // ── classic words mode ───────────────────────────────────────────────
-        if !(10..=12).contains(&args.words.len()) {
-            anyhow::bail!("Expected 10, 11, or 12 words, got {}", args.words.len());
-        }
-        if args.cpu {
-            println!("--cpu flag set: forcing CPU for word search.");
-            run_cpu_search(&args, &target_address, language)?
-        } else {
-            match search_permutations_gpu(&args.words, &target_address, language) {
-                Ok(found) => found,
-                Err(e) => {
-                    eprintln!("GPU search unavailable ({e:#}); falling back to CPU.");
-                    run_cpu_search(&args, &target_address, language)?
-                }
+        match run_search_gpu(&args, &slots, &target, language) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("GPU unavailable ({e:#}); falling back to CPU.");
+                run_search_cpu(&args, &slots, &target, language)?
             }
         }
     };
 
     let elapsed = start.elapsed();
     if !found {
-        println!(
-            "Exhausted all candidates without a match (elapsed: {:?})",
-            elapsed
-        );
+        println!("Exhausted all candidates without a match (elapsed: {elapsed:?})");
     }
-
     Ok(())
 }
 
@@ -181,45 +169,45 @@ fn main() -> Result<()> {
 // Tokenlist parsing
 // ---------------------------------------------------------------------------
 
-/// Parses `tokenlist.txt` into a `Vec<Slot>`.
+/// Parses the tokenlist file into `Vec<Slot>`.
 ///
-/// File format:
-///   • One line = one slot.
-///   • Blank lines and lines starting with `#` are ignored.
-///   • Within a line, alternatives are separated by one or more spaces/tabs.
-///   • Within an alternative, words are separated by commas.
-///
-/// Example line:
-///   orbit,galaxy,venture,sun orbit,galaxy,sun,venture
-///
-/// Yields one slot with two alternatives:
-///   [["orbit","galaxy","venture","sun"], ["orbit","galaxy","sun","venture"]]
+/// Grammar recap:
+///   line      ::= alternative (WS+ alternative)*
+///   alternative ::= token (',' token)*
+///   token     ::= '?' | <bip39_word>
 fn parse_tokenlist(path: &PathBuf) -> Result<Vec<Slot>> {
     let content = fs::read_to_string(path)
-        .with_context(|| format!("Cannot read tokenlist file: {}", path.display()))?;
+        .with_context(|| format!("Cannot read tokenlist: {}", path.display()))?;
 
     let mut slots: Vec<Slot> = Vec::new();
 
-    for (lineno, raw_line) in content.lines().enumerate() {
-        let line = raw_line.trim();
+    for (lineno, raw) in content.lines().enumerate() {
+        let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
 
-        // Split alternatives by whitespace
         let alternatives: Vec<Alternative> = line
             .split_whitespace()
-            .map(|alt| {
-                alt.split(',')
-                    .filter(|w| !w.is_empty())
-                    .map(|w| w.trim().to_string())
+            .map(|alt_str| {
+                alt_str
+                    .split(',')
+                    .filter(|t| !t.is_empty())
+                    .map(|t| {
+                        let t = t.trim();
+                        if t == "?" {
+                            Token::Missing
+                        } else {
+                            Token::Word(t.to_string())
+                        }
+                    })
                     .collect::<Alternative>()
             })
             .filter(|alt| !alt.is_empty())
             .collect();
 
         if alternatives.is_empty() {
-            eprintln!("Warning: line {} is empty after parsing, skipping.", lineno + 1);
+            eprintln!("Warning: line {} empty after parsing, skipping.", lineno + 1);
             continue;
         }
 
@@ -227,169 +215,375 @@ fn parse_tokenlist(path: &PathBuf) -> Result<Vec<Slot>> {
     }
 
     if slots.is_empty() {
-        anyhow::bail!("Tokenlist file is empty or contains no valid lines");
+        anyhow::bail!("Tokenlist is empty or has no valid lines");
     }
 
     println!("Loaded {} slot(s) from tokenlist.", slots.len());
     Ok(slots)
 }
 
+/// Sanity-check: verify every alternative's words exist in the BIP-39 wordlist.
+fn validate_slots(slots: &[Slot], _args: &Args, language: Language) -> Result<()> {
+    let wordlist: &'static [&'static str] = language.words_by_prefix("");
+    for (si, slot) in slots.iter().enumerate() {
+        for (ai, alt) in slot.iter().enumerate() {
+            for token in alt {
+                if let Token::Word(w) = token {
+                    if !wordlist.contains(&w.as_str()) {
+                        anyhow::bail!(
+                            "Slot {}, alternative {}: '{}' is not in the BIP-39 wordlist",
+                            si + 1, ai + 1, w
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
-// GPU tokenlist search
+// Candidate generation — the heart of the new logic
 // ---------------------------------------------------------------------------
 
-/// Tokenlist search using GPU.
+/// Expands a single alternative into concrete (words, missing_count) pairs.
 ///
-/// Strategy: flatten each Cartesian-product combination into a flat word list,
-/// then — for permuted mode — hand each permuted batch to the GPU as a
-/// `candidates::stream` so the GPU can check all 12-word phrases.
+/// `missing_count` is the number of `?` tokens in the alternative.
+/// The returned `Vec<String>` contains only the known words, in their original
+/// positions relative to each other (gaps for `?` are tracked by index).
 ///
-/// When `keep_token_order` is set, missing-word insertion positions are still
-/// permuted on the CPU (cheap), but the GPU handles the crypto.
-fn run_tokenlist_search_gpu(
+/// Returns: `(known_words, missing_count, positions_of_missing)`
+///
+/// `positions_of_missing` is a sorted list of indices into the *full* sequence
+/// (known + missing interleaved) where missing words should be inserted.
+/// This allows position-aware filling later.
+fn expand_alternative(alt: &Alternative) -> (Vec<String>, Vec<usize>) {
+    let mut words: Vec<String> = Vec::new();
+    let mut missing_positions: Vec<usize> = Vec::new();
+    for (i, token) in alt.iter().enumerate() {
+        match token {
+            Token::Word(w) => words.push(w.clone()),
+            Token::Missing => missing_positions.push(i),
+        }
+    }
+    (words, missing_positions)
+}
+
+/// Given a slot's chosen alternative (as known word indices + missing positions),
+/// enumerate all concrete 12-slot-length word-index sequences for this slot.
+///
+/// `keep_word_order` — if true, only the missing word values are varied (positions fixed).
+///                     if false, the known words are also permuted among themselves
+///                     (the missing words stay in their declared positions relative
+///                      to the permuted known words).
+///
+/// Returns an iterator of `Vec<u16>` each of length = `alt.len()`.
+fn slot_candidates(
+    known_indices: &[u16],
+    missing_positions: &[usize],
+    total_len: usize,       // known + missing
+    keep_word_order: bool,
+    wordlist_len: usize,
+) -> Vec<Vec<u16>> {
+    let missing_count = missing_positions.len();
+
+    // Generate all permutations of known words (or just the one original order).
+    let known_perms: Box<dyn Iterator<Item = Vec<u16>>> = if keep_word_order {
+        Box::new(std::iter::once(known_indices.to_vec()))
+    } else {
+        let n = known_indices.len();
+        Box::new(
+            known_indices
+                .iter()
+                .copied()
+                .permutations(n),
+        )
+    };
+
+    let mut results: Vec<Vec<u16>> = Vec::new();
+
+    for known_perm in known_perms {
+        // For each permutation of known words, enumerate all values for missing slots.
+        // Missing positions are fixed (positional meaning is preserved).
+        for missing_values in (0..wordlist_len as u16)
+            .permutations_with_replacement(missing_count)
+        {
+            // Reconstruct the full sequence of length `total_len`.
+            let mut seq: Vec<u16> = Vec::with_capacity(total_len);
+            let mut ki = 0usize; // index into known_perm
+            let mut mi = 0usize; // index into missing_values
+            for pos in 0..total_len {
+                if missing_positions.contains(&pos) {
+                    seq.push(missing_values[mi]);
+                    mi += 1;
+                } else {
+                    seq.push(known_perm[ki]);
+                    ki += 1;
+                }
+            }
+            results.push(seq);
+        }
+    }
+
+    results
+}
+
+// ---------------------------------------------------------------------------
+// Helper: Cartesian product over slots, respecting alternatives
+// ---------------------------------------------------------------------------
+
+/// For a chosen list of slots, produce every combination of:
+///   - one alternative per slot
+///   - (optionally) permuted slot order
+///   - (optionally) permuted word order within each slot
+///
+/// Returns a fully-collected `Vec<Vec<u16>>` where each inner Vec is a complete
+/// phrase expressed as BIP-39 word indices.
+/// Using Vec (not an iterator) avoids Rust lifetime issues with nested closures
+/// borrowing `slot_alt_candidates`.
+fn enumerate_phrases(
+    chosen_slots: &[&Slot],
+    keep_token_order: bool,
+    keep_word_order: bool,
+    wordlist: &'static [&'static str],
+) -> Vec<Vec<u16>> {
+    let wordlist_len = wordlist.len();
+
+    // Step 1: For each slot x alternative, compute all concrete word-index sequences.
+    // Layout: slot_alt_candidates[slot_idx][alt_idx] = Vec<Vec<u16>>
+    let slot_alt_candidates: Vec<Vec<Vec<Vec<u16>>>> = chosen_slots
+        .iter()
+        .map(|slot| {
+            slot.iter()
+                .map(|alt| {
+                    let (known_words, missing_positions) = expand_alternative(alt);
+                    let total_len = alt.len();
+                    let known_indices: Vec<u16> = known_words
+                        .iter()
+                        .map(|w| {
+                            wordlist.iter().position(|x| *x == w.as_str()).unwrap() as u16
+                        })
+                        .collect();
+                    slot_candidates(
+                        &known_indices,
+                        &missing_positions,
+                        total_len,
+                        keep_word_order,
+                        wordlist_len,
+                    )
+                })
+                .collect()
+        })
+        .collect();
+
+    // Step 2: Enumerate slot orderings (all permutations, or fixed single order).
+    let num_slots = chosen_slots.len();
+    let slot_orderings: Vec<Vec<usize>> = if keep_token_order {
+        vec![(0..num_slots).collect()]
+    } else {
+        (0..num_slots).permutations(num_slots).collect()
+    };
+
+    // Step 3: For each slot ordering x alt combination x per-slot candidate,
+    // concatenate into a single flat phrase and push to results.
+    let mut results: Vec<Vec<u16>> = Vec::new();
+
+    for order in &slot_orderings {
+        // Cartesian product: choose one alternative index per slot in this order.
+        let alt_counts: Vec<usize> = order
+            .iter()
+            .map(|&si| slot_alt_candidates[si].len())
+            .collect();
+
+        for alt_indices in alt_counts.iter().map(|&n| 0..n).multi_cartesian_product() {
+            // Collect the per-slot candidate lists for this alt-combination.
+            let per_slot: Vec<&Vec<Vec<u16>>> = order
+                .iter()
+                .zip(alt_indices.iter())
+                .map(|(&si, &ai)| &slot_alt_candidates[si][ai])
+                .collect();
+
+            // Cartesian product across per-slot candidate lists, then concatenate.
+            let cand_counts: Vec<usize> = per_slot.iter().map(|c| c.len()).collect();
+            for cand_indices in cand_counts.iter().map(|&n| 0..n).multi_cartesian_product() {
+                let phrase: Vec<u16> = per_slot
+                    .iter()
+                    .zip(cand_indices.iter())
+                    .flat_map(|(cands, &ci)| cands[ci].iter().copied())
+                    .collect();
+                results.push(phrase);
+            }
+        }
+    }
+
+    results
+}
+
+// ---------------------------------------------------------------------------
+// Permutations-with-replacement helper (not in itertools by default)
+// ---------------------------------------------------------------------------
+
+trait PermutationsWithReplacement: Iterator + Sized {
+    fn permutations_with_replacement(self, k: usize) -> PermWithReplacement<Self::Item>
+    where
+        Self::Item: Clone;
+}
+
+struct PermWithReplacement<T> {
+    pool: Vec<T>,
+    indices: Vec<usize>,
+    k: usize,
+    first: bool,
+    done: bool,
+}
+
+impl<I: Iterator> PermutationsWithReplacement for I
+where
+    I::Item: Clone,
+{
+    fn permutations_with_replacement(self, k: usize) -> PermWithReplacement<I::Item> {
+        let pool: Vec<I::Item> = self.collect();
+        let n = pool.len();
+        if k == 0 || n == 0 {
+            return PermWithReplacement { pool, indices: vec![], k, first: true, done: k != 0 };
+        }
+        PermWithReplacement {
+            pool,
+            indices: vec![0usize; k],
+            k,
+            first: true,
+            done: false,
+        }
+    }
+}
+
+impl<T: Clone> Iterator for PermWithReplacement<T> {
+    type Item = Vec<T>;
+
+    fn next(&mut self) -> Option<Vec<T>> {
+        if self.done {
+            return None;
+        }
+        if self.k == 0 {
+            self.done = true;
+            return Some(vec![]);
+        }
+        if self.first {
+            self.first = false;
+            return Some(self.indices.iter().map(|&i| self.pool[i].clone()).collect());
+        }
+        // Increment: rightmost digit that hasn't reached pool.len()-1.
+        let n = self.pool.len();
+        let mut pos = self.k as isize - 1;
+        while pos >= 0 && self.indices[pos as usize] == n - 1 {
+            self.indices[pos as usize] = 0;
+            pos -= 1;
+        }
+        if pos < 0 {
+            self.done = true;
+            return None;
+        }
+        self.indices[pos as usize] += 1;
+        Some(self.indices.iter().map(|&i| self.pool[i].clone()).collect())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GPU search
+// ---------------------------------------------------------------------------
+
+fn run_search_gpu(
     args: &Args,
     slots: &[Slot],
     target: &Address<NetworkChecked>,
     language: Language,
 ) -> Result<bool> {
-    // Initialise GPU once and reuse across all sub-searches.
-    let gpu = gpu::Gpu::new()?;
-    println!("Using GPU (CUDA) for tokenlist search.");
-
+    let gpu_handle = gpu::Gpu::new()?;
     let wordlist: &'static [&'static str] = language.words_by_prefix("");
     let gpu_wordlist = gpu::GpuWordlist::new(wordlist)?;
     let target_h160 = p2pkh_hash160(target)?;
     let batch_size = 1 << 20;
 
+    println!("Using GPU (CUDA) for tokenlist search.");
+
     let min_token = args.min_token.unwrap_or(slots.len()).min(slots.len());
     let max_token = slots.len();
-    println!(
-        "Trying slot subsets of size {}..={} (--min-token={}).",
-        min_token, max_token, min_token
-    );
+    println!("Trying slot subsets {min_token}..={max_token}.");
 
     let mut total_checked: usize = 0;
 
     for slot_count in min_token..=max_token {
         let slot_indices: Vec<usize> = (0..slots.len()).collect();
 
-        for chosen_slot_indices in slot_indices.iter().copied().combinations(slot_count) {
-            let chosen_slots: Vec<&Slot> =
-                chosen_slot_indices.iter().map(|&i| &slots[i]).collect();
+        for chosen_indices in slot_indices.iter().copied().combinations(slot_count) {
+            let chosen: Vec<&Slot> = chosen_indices.iter().map(|&i| &slots[i]).collect();
 
-            // Cartesian product over alternatives for this slot combination.
-            for words in cartesian_product_slots(&chosen_slots) {
-                let word_count = words.len();
-                if word_count > 12 || word_count < 10 {
-                    continue;
-                }
-                let missing = 12 - word_count;
-
-                // Resolve word indices in the BIP-39 wordlist.
-                let mut known_idx: Vec<u16> = Vec::with_capacity(word_count);
-                let mut all_valid = true;
-                for w in &words {
-                    match wordlist.iter().position(|x| *x == w.as_str()) {
-                        Some(pos) => known_idx.push(pos as u16),
-                        None => {
-                            eprintln!("Warning: word '{w}' not in BIP-39 wordlist — skipping combination.");
-                            all_valid = false;
-                            break;
-                        }
-                    }
-                }
-                if !all_valid {
+            // enumerate_phrases yields Vec<u16> (full 12-word phrase as indices).
+            for phrase_indices in enumerate_phrases(
+                &chosen,
+                args.keep_token_order,
+                args.keep_word_order,
+                wordlist,
+            ) {
+                if phrase_indices.len() != 12 {
+                    // Skip phrases that don't sum to 12 words.
                     continue;
                 }
 
-                if args.keep_token_order {
-                    // ── keep order: GPU handles missing-word search ──────────
-                    // Feed the fixed ordered base directly through GPU candidate stream.
-                    let cands = candidates::stream_with_base(known_idx, wordlist.len(), missing);
-                    if let Some(hit) =
-                        gpu.search(cands, &gpu_wordlist, &target_h160, batch_size)?
-                    {
-                        let phrase: Vec<&str> =
-                            hit.indices.iter().map(|&i| wordlist[i as usize]).collect();
-                        let phrase = phrase.join(" ");
-                        println!("Found matching mnemonic: {}", phrase);
-                        println!("Candidate index (0-based): {}", hit.global_index);
-                        println!("Derived address: {}", target);
-                        return Ok(true);
-                    }
-                    total_checked += candidates::count_with_base(word_count, wordlist.len(), missing);
-                } else {
-                    // ── permuted: iterate permutations on CPU, GPU per permutation ──
-                    let n = word_count;
-                    let perms: Vec<Vec<u16>> =
-                        known_idx.iter().copied().permutations(n).collect();
+                // Single fixed phrase — no further missing slots; wrap as 1-item iterator.
+                let cand_iter = std::iter::once({
+                    let mut a = [0u16; 12];
+                    a.copy_from_slice(&phrase_indices);
+                    a
+                });
 
-                    for perm in perms {
-                        let cands =
-                            candidates::stream_with_base(perm, wordlist.len(), missing);
-                        if let Some(hit) =
-                            gpu.search(cands, &gpu_wordlist, &target_h160, batch_size)?
-                        {
-                            let phrase: Vec<&str> =
-                                hit.indices.iter().map(|&i| wordlist[i as usize]).collect();
-                            let phrase = phrase.join(" ");
-                            println!("Found matching mnemonic: {}", phrase);
-                            println!("Candidate index (0-based): {}", hit.global_index);
-                            println!("Derived address: {}", target);
-                            return Ok(true);
-                        }
-                        total_checked +=
-                            candidates::count_with_base(word_count, wordlist.len(), missing);
+                if let Some(hit) =
+                    gpu_handle.search(cand_iter, &gpu_wordlist, &target_h160, batch_size)?
+                {
+                    let phrase: Vec<&str> =
+                        hit.indices.iter().map(|&i| wordlist[i as usize]).collect();
+                    println!("Found matching mnemonic: {}", phrase.join(" "));
+                    println!("Candidate index (0-based): {}", hit.global_index);
+                    println!("Derived address: {target}");
+                    return Ok(true);
+                }
 
-                        if total_checked % 10_000_000 < batch_size {
-                            println!("Checked ~{} candidates...", format_number(total_checked));
-                            let _ = io::stdout().flush();
-                        }
-                    }
+                total_checked += 1;
+                if total_checked % 1_000_000 == 0 {
+                    println!("Checked ~{} candidates...", format_number(total_checked));
+                    let _ = io::stdout().flush();
                 }
             }
-
-            // Break outer early once all slot-combos at this level are done.
-            // (The 'outer label handles early-exit when a match is found above.)
         }
     }
 
-     // suppress "unused label" warning if we never break it.
     Ok(false)
 }
 
 // ---------------------------------------------------------------------------
-// CPU tokenlist search (renamed from original run_tokenlist_search)
+// CPU search
 // ---------------------------------------------------------------------------
 
-fn run_tokenlist_search_cpu(
+fn run_search_cpu(
     args: &Args,
     slots: &[Slot],
     target: &Address<NetworkChecked>,
     language: Language,
 ) -> Result<bool> {
-    let num_threads = if args.threads == 0 {
-        num_cpus::get()
-    } else {
-        args.threads
-    };
+    let num_threads = if args.threads == 0 { num_cpus::get() } else { args.threads };
     let _ = rayon::ThreadPoolBuilder::new()
         .num_threads(num_threads)
         .build_global();
-    println!("Using CPU with {} threads (tokenlist mode)", num_threads);
-
-    let min_token = args.min_token.unwrap_or(slots.len()).min(slots.len());
-    let max_token = slots.len();
-
-    println!(
-        "Trying slot subsets of size {}..={} (--min-token={}).",
-        min_token, max_token, min_token
-    );
+    println!("Using CPU with {num_threads} threads.");
 
     let wordlist: &'static [&'static str] = language.words_by_prefix("");
     let target_str = target.to_string();
     let derivation_path: DerivationPath = "m/44'/0'/0'/0/0".parse()?;
     let secp = Arc::new(Secp256k1::new());
+
+    let min_token = args.min_token.unwrap_or(slots.len()).min(slots.len());
+    let max_token = slots.len();
+    println!("Trying slot subsets {min_token}..={max_token}.");
 
     let counter = Arc::new(AtomicUsize::new(0));
     let found = Arc::new(AtomicBool::new(false));
@@ -403,91 +597,61 @@ fn run_tokenlist_search_cpu(
 
         let slot_indices: Vec<usize> = (0..slots.len()).collect();
 
-        for chosen_slot_indices in slot_indices.iter().copied().combinations(slot_count) {
+        for chosen_indices in slot_indices.iter().copied().combinations(slot_count) {
             if found.load(Ordering::Relaxed) {
                 break 'outer;
             }
 
-            let chosen_slots: Vec<&Slot> =
-                chosen_slot_indices.iter().map(|&i| &slots[i]).collect();
+            let chosen: Vec<&Slot> = chosen_indices.iter().map(|&i| &slots[i]).collect();
 
-            let phrase_words_iter = cartesian_product_slots(&chosen_slots);
+            let phrases: Vec<Vec<u16>> = enumerate_phrases(
+                &chosen,
+                args.keep_token_order,
+                args.keep_word_order,
+                wordlist,
+            )
+            .into_iter()
+            .filter(|p: &Vec<u16>| p.len() == 12)
+            .collect();
 
-            phrase_words_iter
-                .par_bridge()
-                .for_each(|words: Vec<String>| {
-                    if found.load(Ordering::Relaxed) {
-                        return;
-                    }
+            phrases.into_par_iter().for_each(|phrase_indices: Vec<u16>| {
+                if found.load(Ordering::Relaxed) {
+                    return;
+                }
 
-                    let word_count = words.len();
-                    if word_count > 12 {
-                        return;
-                    }
-                    let missing = 12 - word_count;
-                    if word_count < 10 {
-                        return;
-                    }
+                let i = counter.fetch_add(1, Ordering::Relaxed);
+                if i % 100_000 == 0 && i > 0 {
+                    println!("Checked {} candidates...", format_number(i));
+                    let _ = io::stdout().flush();
+                }
 
-                    let candidates: Box<dyn Iterator<Item = String> + Send> =
-                        if args.keep_token_order {
-                            Box::new(
-                                insert_missing(words, missing, wordlist)
-                                    .map(|v| v.join(" ")),
-                            )
-                        } else {
-                            let n = words.len();
-                            Box::new(
-                                words
-                                    .into_iter()
-                                    .permutations(n)
-                                    .flat_map(move |base| {
-                                        insert_missing(base, missing, wordlist)
-                                            .map(|v| v.join(" "))
-                                    }),
-                            )
-                        };
+                let phrase: Vec<&str> =
+                    phrase_indices.iter().map(|&idx| wordlist[idx as usize]).collect();
+                let phrase_str = phrase.join(" ");
 
-                    for phrase in candidates {
-                        if found.load(Ordering::Relaxed) {
-                            return;
-                        }
+                let mnemonic = match Mnemonic::parse_in_normalized(language, &phrase_str) {
+                    Ok(m) => m,
+                    Err(_) => return,
+                };
 
-                        let i = counter.fetch_add(1, Ordering::Relaxed);
-                        if i % 100_000 == 0 && i > 0 {
-                            println!("Checked {} candidates...", format_number(i));
-                            let _ = io::stdout().flush();
-                        }
+                let seed = mnemonic.to_seed("");
+                let master_xprv = match Xpriv::new_master(Network::Bitcoin, &seed) {
+                    Ok(x) => x,
+                    Err(_) => return,
+                };
+                let child_xprv = match master_xprv.derive_priv(&secp, &derivation_path) {
+                    Ok(x) => x,
+                    Err(_) => return,
+                };
+                let child_pub = PublicKey::new(child_xprv.private_key.public_key(&secp));
+                let addr: Address<NetworkChecked> = Address::p2pkh(&child_pub, Network::Bitcoin);
 
-                        let mnemonic = match Mnemonic::parse_in_normalized(language, &phrase) {
-                            Ok(m) => m,
-                            Err(_) => continue,
-                        };
-
-                        let seed = mnemonic.to_seed("");
-                        let master_xprv = match Xpriv::new_master(Network::Bitcoin, &seed) {
-                            Ok(x) => x,
-                            Err(_) => continue,
-                        };
-                        let child_xprv =
-                            match master_xprv.derive_priv(&secp, &derivation_path) {
-                                Ok(x) => x,
-                                Err(_) => continue,
-                            };
-                        let child_priv = child_xprv.private_key;
-                        let child_pub = PublicKey::new(child_priv.public_key(&secp));
-                        let addr: Address<NetworkChecked> =
-                            Address::p2pkh(&child_pub, Network::Bitcoin);
-
-                        if addr.to_string() == target_str {
-                            found.store(true, Ordering::SeqCst);
-                            found_index.store(i, Ordering::SeqCst);
-                            let mut fp = found_phrase.lock().unwrap();
-                            *fp = phrase;
-                            return;
-                        }
-                    }
-                });
+                if addr.to_string() == target_str {
+                    found.store(true, Ordering::SeqCst);
+                    found_index.store(i, Ordering::SeqCst);
+                    *found_phrase.lock().unwrap() = phrase_str;
+                }
+            });
 
             if found.load(Ordering::SeqCst) {
                 break 'outer;
@@ -498,9 +662,9 @@ fn run_tokenlist_search_cpu(
     if found.load(Ordering::SeqCst) {
         let fp = found_phrase.lock().unwrap();
         let idx = found_index.load(Ordering::SeqCst);
-        println!("Found matching mnemonic: {}", *fp);
-        println!("Candidate index (0-based): {}", idx);
-        println!("Derived address: {}", target_str);
+        println!("Found matching mnemonic: {fp}");
+        println!("Candidate index (0-based): {idx}");
+        println!("Derived address: {target_str}");
         Ok(true)
     } else {
         Ok(false)
@@ -508,42 +672,8 @@ fn run_tokenlist_search_cpu(
 }
 
 // ---------------------------------------------------------------------------
-// Cartesian-product helper (unchanged)
+// P2PKH helpers
 // ---------------------------------------------------------------------------
-
-fn cartesian_product_slots<'a>(
-    slots: &'a [&'a Slot],
-) -> impl Iterator<Item = Vec<String>> + 'a {
-    let alt_lists: Vec<&[Alternative]> = slots.iter().map(|s| s.as_slice()).collect();
-
-    alt_lists
-        .into_iter()
-        .multi_cartesian_product()
-        .map(|chosen_alts: Vec<&Alternative>| {
-            chosen_alts.iter().flat_map(|alt| alt.iter().cloned()).collect()
-        })
-}
-
-// ---------------------------------------------------------------------------
-// Classic CPU / GPU search helpers (unchanged)
-// ---------------------------------------------------------------------------
-
-fn run_cpu_search(
-    args: &Args,
-    target_address: &Address<NetworkChecked>,
-    language: Language,
-) -> Result<bool> {
-    let num_threads = if args.threads == 0 {
-        num_cpus::get()
-    } else {
-        args.threads
-    };
-    let _ = rayon::ThreadPoolBuilder::new()
-        .num_threads(num_threads)
-        .build_global();
-    println!("Using CPU with {} threads", num_threads);
-    search_permutations_parallel(&args.words, target_address, language)
-}
 
 fn p2pkh_hash160(addr: &Address<NetworkChecked>) -> Result<[u8; 20]> {
     let spk = addr.script_pubkey();
@@ -557,70 +687,17 @@ fn p2pkh_hash160(addr: &Address<NetworkChecked>) -> Result<[u8; 20]> {
     }
 }
 
-fn search_permutations_gpu(
-    words: &[String],
-    target: &Address<NetworkChecked>,
-    language: Language,
-) -> Result<bool> {
-    let gpu = gpu::Gpu::new()?;
-    println!("Using GPU (CUDA)");
-
-    let wordlist: &'static [&'static str] = language.words_by_prefix("");
-    let gpu_wordlist = gpu::GpuWordlist::new(wordlist)?;
-    let target_h160 = p2pkh_hash160(target)?;
-
-    let mut known_idx: Vec<u16> = Vec::with_capacity(words.len());
-    for w in words {
-        let pos = wordlist
-            .iter()
-            .position(|x| *x == w)
-            .with_context(|| format!("Word '{w}' is not in the BIP-39 wordlist"))?;
-        known_idx.push(pos as u16);
-    }
-
-    let missing = 12 - words.len();
-    if missing > 0 {
-        println!(
-            "Got {} words; completing {} missing word(s) from the {}-word BIP-39 list.",
-            words.len(),
-            missing,
-            wordlist.len()
-        );
-    }
-    let total = total_candidates(words.len(), wordlist.len(), missing);
-    println!(
-        "Searching {} candidates on GPU (streamed)...",
-        format_number(total)
-    );
-
-    let candidates = candidates::stream(known_idx, wordlist.len());
-    let batch_size = 1 << 20;
-    let hit = gpu.search(candidates, &gpu_wordlist, &target_h160, batch_size)?;
-
-    match hit {
-        Some(h) => {
-            let phrase: Vec<&str> = h.indices.iter().map(|&i| wordlist[i as usize]).collect();
-            let phrase = phrase.join(" ");
-            println!("Found matching mnemonic: {}", phrase);
-            if missing > 0 {
-                let recovered = recovered_words(words, &phrase);
-                println!("Recovered missing word(s): {}", recovered.join(" "));
-            }
-            println!("Candidate index (0-based): {}", h.global_index);
-            println!("Derived address: {}", target);
-            Ok(true)
-        }
-        None => Ok(false),
-    }
-}
+// ---------------------------------------------------------------------------
+// Misc helpers
+// ---------------------------------------------------------------------------
 
 pub fn format_number(n: usize) -> String {
     if n >= 1_000_000_000 {
-        format!("{:.1}G", n as f64 / 1_000_000_000.0)
+        format!("{:.1}G", n as f64 / 1e9)
     } else if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
+        format!("{:.1}M", n as f64 / 1e6)
     } else if n >= 1_000 {
-        format!("{:.1}K", n as f64 / 1_000.0)
+        format!("{:.1}K", n as f64 / 1e3)
     } else {
         n.to_string()
     }
@@ -628,151 +705,19 @@ pub fn format_number(n: usize) -> String {
 
 fn parse_language(lang: &str) -> Result<Language> {
     match lang.to_lowercase().as_str() {
-        "english" => Ok(Language::English),
-        "portuguese" => Ok(Language::Portuguese),
-        "spanish" => Ok(Language::Spanish),
-        "french" => Ok(Language::French),
-        "italian" => Ok(Language::Italian),
-        "czech" => Ok(Language::Czech),
-        "korean" => Ok(Language::Korean),
-        "japanese" => Ok(Language::Japanese),
-        "chinese-simplified" => Ok(Language::SimplifiedChinese),
-        "chinese-traditional" => Ok(Language::TraditionalChinese),
+        "english"              => Ok(Language::English),
+        "portuguese"           => Ok(Language::Portuguese),
+        "spanish"              => Ok(Language::Spanish),
+        "french"               => Ok(Language::French),
+        "italian"              => Ok(Language::Italian),
+        "czech"                => Ok(Language::Czech),
+        "korean"               => Ok(Language::Korean),
+        "japanese"             => Ok(Language::Japanese),
+        "chinese-simplified"   => Ok(Language::SimplifiedChinese),
+        "chinese-traditional"  => Ok(Language::TraditionalChinese),
         _ => anyhow::bail!(
-            "Unknown language: {}. Supported: english, portuguese, spanish, french, \
-             italian, czech, korean, japanese, chinese-simplified, chinese-traditional",
-            lang
+            "Unknown language '{lang}'. Supported: english, portuguese, spanish, french, \
+             italian, czech, korean, japanese, chinese-simplified, chinese-traditional"
         ),
     }
-}
-
-fn search_permutations_parallel(
-    words: &[String],
-    target: &Address<NetworkChecked>,
-    language: Language,
-) -> Result<bool> {
-    let derivation_path: DerivationPath = "m/44'/0'/0'/0/0".parse()?;
-    let target_str = target.to_string();
-    let secp = Arc::new(Secp256k1::new());
-    let missing = 12 - words.len();
-    let wordlist: &'static [&'static str] = language.words_by_prefix("");
-
-    if missing > 0 {
-        println!(
-            "Got {} words; completing {} missing word(s) from the {}-word BIP-39 list.",
-            words.len(),
-            missing,
-            wordlist.len()
-        );
-    }
-
-    let total = total_candidates(words.len(), wordlist.len(), missing);
-    println!(
-        "Searching {} candidates (streamed, not held in memory)...",
-        format_number(total)
-    );
-    let _ = io::stdout().flush();
-
-    let owned_words: Vec<String> = words.to_vec();
-    let candidates = owned_words
-        .into_iter()
-        .permutations(words.len())
-        .flat_map(move |base| insert_missing(base, missing, wordlist).map(|v| v.join(" ")));
-
-    let counter = Arc::new(AtomicUsize::new(0));
-    let found = Arc::new(AtomicBool::new(false));
-    let found_phrase = Arc::new(std::sync::Mutex::new(String::new()));
-    let found_index = Arc::new(AtomicUsize::new(0));
-
-    candidates.par_bridge().for_each(|phrase| {
-        if found.load(Ordering::Relaxed) {
-            return;
-        }
-
-        let i = counter.fetch_add(1, Ordering::Relaxed);
-        if i % 100000 == 0 && i > 0 {
-            println!("Checked {} candidates...", format_number(i));
-            let _ = io::stdout().flush();
-        }
-
-        let mnemonic = match Mnemonic::parse_in_normalized(language, &phrase) {
-            Ok(m) => m,
-            Err(_) => return,
-        };
-
-        let seed = mnemonic.to_seed("");
-        let master_xprv = match Xpriv::new_master(Network::Bitcoin, &seed) {
-            Ok(x) => x,
-            Err(_) => return,
-        };
-        let child_xprv = match master_xprv.derive_priv(&secp, &derivation_path) {
-            Ok(x) => x,
-            Err(_) => return,
-        };
-        let child_priv = child_xprv.private_key;
-        let child_pub = PublicKey::new(child_priv.public_key(&secp));
-        let addr: Address<NetworkChecked> = Address::p2pkh(&child_pub, Network::Bitcoin);
-
-        if addr.to_string() == target_str {
-            found.store(true, Ordering::SeqCst);
-            found_index.store(i, Ordering::SeqCst);
-            let mut fp = found_phrase.lock().unwrap();
-            *fp = phrase;
-        }
-    });
-
-    if found.load(Ordering::SeqCst) {
-        let fp = found_phrase.lock().unwrap();
-        let idx = found_index.load(Ordering::SeqCst);
-        println!("Found matching mnemonic: {}", *fp);
-        if missing > 0 {
-            let recovered = recovered_words(words, &fp);
-            println!("Recovered missing word(s): {}", recovered.join(" "));
-        }
-        println!("Candidate index (0-based): {}", idx);
-        println!("Derived address: {}", target_str);
-        Ok(true)
-    } else {
-        Ok(false)
-    }
-}
-
-fn total_candidates(n: usize, wordlist_len: usize, missing: usize) -> usize {
-    let factorial: usize = (1..=n).product::<usize>().max(1);
-    factorial * wordlist_len.pow(missing as u32)
-}
-
-fn insert_missing(
-    seq: Vec<String>,
-    remaining: usize,
-    wordlist: &'static [&'static str],
-) -> Box<dyn Iterator<Item = Vec<String>> + Send> {
-    if remaining == 0 {
-        return Box::new(std::iter::once(seq));
-    }
-
-    let len = seq.len();
-    Box::new((0..=len).flat_map(move |pos| {
-        let seq = seq.clone();
-        wordlist.iter().flat_map(move |&word| {
-            let mut next = Vec::with_capacity(seq.len() + 1);
-            next.extend_from_slice(&seq[..pos]);
-            next.push(word.to_string());
-            next.extend_from_slice(&seq[pos..]);
-            insert_missing(next, remaining - 1, wordlist)
-        })
-    }))
-}
-
-fn recovered_words(known: &[String], phrase: &str) -> Vec<String> {
-    let mut remaining: Vec<String> = known.to_vec();
-    let mut recovered = Vec::new();
-    for word in phrase.split_whitespace() {
-        if let Some(pos) = remaining.iter().position(|k| k == word) {
-            remaining.remove(pos);
-        } else {
-            recovered.push(word.to_string());
-        }
-    }
-    recovered
 }
