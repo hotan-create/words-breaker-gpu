@@ -518,42 +518,51 @@ fn run_search_gpu(
         for chosen_indices in slot_indices.iter().copied().combinations(slot_count) {
             let chosen: Vec<&Slot> = chosen_indices.iter().map(|&i| &slots[i]).collect();
 
-            // enumerate_phrases yields Vec<u16> (full 12-word phrase as indices).
-            for phrase_indices in enumerate_phrases(
+            // Kumpulkan SEMUA phrase untuk kombinasi slot ini sekaligus
+            let all_phrases: Vec<[u16; 12]> = enumerate_phrases(
                 &chosen,
                 args.keep_token_order,
                 args.keep_word_order,
                 wordlist,
-            ) {
-                if phrase_indices.len() != 12 {
-                    // Skip phrases that don't sum to 12 words.
-                    continue;
-                }
+            )
+            .into_iter()
+            .filter(|p| p.len() == 12)
+            .map(|p| {
+                let mut a = [0u16; 12];
+                a.copy_from_slice(&p);
+                a
+            })
+            .collect();
 
-                // Single fixed phrase — no further missing slots; wrap as 1-item iterator.
-                let cand_iter = std::iter::once({
-                    let mut a = [0u16; 12];
-                    a.copy_from_slice(&phrase_indices);
-                    a
-                });
-
-                if let Some(hit) =
-                    gpu_handle.search(cand_iter, &gpu_wordlist, &target_h160, batch_size)?
-                {
-                    let phrase: Vec<&str> =
-                        hit.indices.iter().map(|&i| wordlist[i as usize]).collect();
-                    println!("Found matching mnemonic: {}", phrase.join(" "));
-                    println!("Candidate index (0-based): {}", hit.global_index);
-                    println!("Derived address: {target}");
-                    return Ok(true);
-                }
-
-                total_checked += 1;
-                if total_checked % 1_000_000 == 0 {
-                    println!("Checked ~{} candidates...", format_number(total_checked));
-                    let _ = io::stdout().flush();
-                }
+            if all_phrases.is_empty() {
+                continue;
             }
+
+            let phrase_count = all_phrases.len();
+            println!(
+                "Slot combination {:?}: {} phrase(s) to check on GPU.",
+                chosen_indices,
+                format_number(phrase_count)
+            );
+
+            // Kirim seluruh batch sekaligus ke GPU
+            if let Some(hit) =
+                gpu_handle.search(all_phrases.into_iter(), &gpu_wordlist, &target_h160, batch_size)?
+            {
+                let phrase: Vec<&str> =
+                    hit.indices.iter().map(|&i| wordlist[i as usize]).collect();
+                println!("Found matching mnemonic: {}", phrase.join(" "));
+                println!("Candidate index (0-based): {}", hit.global_index);
+                println!("Derived address: {target}");
+                return Ok(true);
+            }
+
+            total_checked += phrase_count;
+            println!(
+                "Checked ~{} candidates total so far...",
+                format_number(total_checked)
+            );
+            let _ = io::stdout().flush();
         }
     }
 
