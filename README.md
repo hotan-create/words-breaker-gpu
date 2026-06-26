@@ -1,121 +1,263 @@
-# Words Breaker
+# 🔑 WORD BREAKER GPU WITH TOKENLIST INPUT
 
-A command-line tool that attempts to recover a BIP-39 mnemonic seed phrase by testing permutations of 12 known words against a target Bitcoin legacy address.
+> High-performance BIP-39 mnemonic recovery for Bitcoin legacy addresses — with CPU multi-threading and CUDA GPU acceleration.
 
-## Use Case
+[![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange?logo=rust)](https://www.rust-lang.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![CUDA](https://img.shields.io/badge/CUDA-optional-green?logo=nvidia)](https://developer.nvidia.com/cuda-toolkit)
 
-If you have 12 BIP-39 mnemonic words but don't remember the correct order, this tool will brute-force permutations to find the combination that derives to your known Bitcoin address.
+---
 
-## Prerequisites
+## 📋 Table of Contents
 
-- [Rust](https://www.rust-lang.org/tools/install) (1.70 or later recommended)
-- An **NVIDIA GPU** plus the **CUDA toolkit** (`nvcc`) — the search runs on the GPU
-  by default. The build compiles the CUDA kernels (`src/cuda/kernels.cu`) to PTX
-  with `nvcc`. If no CUDA device is present at runtime, the tool falls back to the
-  CPU automatically (or pass `--cpu`).
+- [Overview](#overview)
+- [Features](#features)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Tokenlist Format](#tokenlist-format)
+- [Examples](#examples)
+- [How It Works](#how-it-works)
+- [Performance](#performance)
+- [Troubleshooting](#troubleshooting)
+- [Disclaimer](#disclaimer)
 
-### CUDA library path
+---
 
-`cust` locates the CUDA driver library via `CUDA_LIBRARY_PATH`, which must point at
-a CUDA root containing `lib64/` and `include/cuda.h`. On a distro-packaged CUDA
-install (`nvcc` in `/usr/bin`) that is `/usr/lib/cuda`, and `.cargo/config.toml`
-already sets it. For a standard toolkit install, export your root, e.g.:
+## Overview
+
+BTC Mnemonic Recovery Tool helps you recover a forgotten or partially-known BIP-39 mnemonic phrase by exhaustively trying permutations of known word fragments against a target Bitcoin legacy (P2PKH) address.
+
+You provide the words you remember (organized as **slots** and **alternatives**), and the tool finds the exact 12-word phrase that derives your address.
+
+---
+
+## Features
+
+- ✅ **CPU multi-threaded** search via [Rayon](https://github.com/rayon-rs/rayon)
+- ✅ **GPU (CUDA) accelerated** search for massive throughput
+- ✅ **Flexible tokenlist format** — slots, alternatives, wildcard `?` for missing words
+- ✅ **Slot & word permutations** — tries all orderings unless pinned with flags
+- ✅ **Subset search** — try combinations of fewer slots via `--min-token`
+- ✅ **BIP-39 multi-language** support (10 languages)
+- ✅ **Self-test mode** for GPU primitive verification
+
+---
+
+## Requirements
+
+| Component | Requirement |
+|-----------|-------------|
+| Rust | 1.75 or later |
+| CUDA Toolkit | 11.x / 12.x (optional, for GPU mode) |
+| GPU | NVIDIA with CUDA support (optional) |
+| OS | Linux, macOS, Windows |
+
+---
+
+## Installation
 
 ```bash
-export CUDA_LIBRARY_PATH=/usr/local/cuda
-```
+# Clone the repository
+git clone https://github.com/hotan-create/words-breaker-gpu.git
+cd word-breaker-gpu
 
-## Building
-
-### Windows
-
-```powershell
+# Build with GPU support (requires CUDA toolkit)
 cargo build --release
 ```
 
-The binary will be located at `target\release\words-breaker.exe`.
+The binary will be at `target/release/word-breaker`.
 
-### Linux / macOS
-
-```bash
-cargo build --release
-```
-
-The binary will be located at `target/release/words-breaker`.
+---
 
 ## Usage
 
 ```
-words-breaker <TARGET_ADDRESS> <WORD1> <WORD2> ... <WORD12> [OPTIONS]
+./target/release/words-breaker 1JKQKyPXm42BPQfu2pevNzT1ej5KBcdaHS --tokenlist tokenlist.txt --min-token 3 --keep-word-order --keep-token-order
 ```
 
-### Arguments
-
-| Argument | Description |
-|----------|-------------|
-| `TARGET_ADDRESS` | Target legacy Bitcoin (P2PKH) address (Base58, starting with `1`) |
-| `WORD1..WORDN` | 10, 11, or 12 BIP-39 words in any order. With 10 or 11 words, the missing word(s) are completed from the 2048-word BIP-39 list. |
 
 ### Options
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `-l, --language` | `english` | BIP-39 wordlist language |
-| `-t, --threads` | `0` (all cores) | CPU threads (CPU path only) |
-| `--cpu` | off | Force the CPU (rayon) search instead of the GPU |
-| `--selftest` | | Verify each GPU crypto primitive against the CPU reference and exit |
-| `-h, --help` | | Print help |
-| `-V, --version` | | Print version |
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--tokenlist <FILE>` | — | Path to tokenlist file (required) |
+| `--language`, `-l` | `english` | BIP-39 wordlist language |
+| `--keep-token-order` | off | Do not permute slot order |
+| `--keep-word-order` | off | Do not permute word order within slots |
+| `--min-token <N>` | all slots | Minimum number of slots to use |
+| `--cpu` | off | Force CPU mode even if GPU is available |
+| `--selftest` | off | Verify GPU primitives and exit |
 
-The search runs on the **GPU by default**, streaming candidates in batches. Each
-batch is filtered by BIP-39 checksum on the GPU (a cheap pass that keeps ~1/16 of
-candidates), then only the survivors run the full seed/derivation/address
-pipeline. Use `--selftest` to confirm the GPU primitives (SHA-256/512, RIPEMD-160,
-HMAC, PBKDF2, secp256k1, BIP32) match the reference CPU crates bit-for-bit.
+---
 
-**Supported languages:** `english`, `portuguese`, `spanish`, `french`, `italian`, `czech`, `korean`, `japanese`, `chinese-simplified`, `chinese-traditional`
+## Tokenlist Format
 
-### Examples
+The tokenlist file is the core input. Each **line** represents one **slot** (one positional group of words in the mnemonic).
 
-**Windows:**
-```powershell
-.\target\release\words-breaker.exe 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa abandon ability able about above absent absorb abstract absurd abuse access accident
+### Rules
+
+```
+# Lines starting with '#' are comments and are ignored.
+# Blank lines are also ignored.
+# Each line = one SLOT
+# Alternatives within a line are separated by WHITESPACE
+# Words within an alternative are separated by COMMAS
+# '?' marks a missing/unknown word to be brute-forced
+
+### Key Concepts
+
+| Concept | Syntax | Meaning |
+|---------|--------|---------|
+| **Slot** | One line | A positional group in the phrase |
+| **Alternative** | Words separated by space | One of multiple possible groups for a slot |
+| **Multi-word alternative** | `word1,word2` | Multiple words that appear together |
+| **Wildcard** | `?` | Unknown word — searched from full BIP-39 wordlist |
+
+### Example Tokenlist.txt
+
+```
+galaxy,meat,evil,faith
+oxygen,donor,?,donkey
+popular,friend,oval,venture
+
+note : missing word is fixed order ( you can edit the tokenlist with mutual exclusion
+example 
+
+galaxy,meat,evil,faith
+?oxygen,donor,donkey oxygen,?,donor,donkey oxygen,donor,?,donkey oxygen,donor,donkey,?
+popular,friend,oval,venture
 ```
 
-**Linux / macOS:**
+Total words across chosen slots must equal **12** (standard BIP-39 mnemonic length).
+
+---
+
+## Examples
+
+### Basic CPU search
+
 ```bash
-./target/release/words-breaker 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa abandon ability able about above absent absorb abstract absurd abuse access accident
+./target/release/words-breaker 1At7z8J3t3JJiAqtBTyJuHdCMKx45HmyVp --tokenlist tokenlist.txt --min-token 3 --cpu
 ```
 
-**Verify the GPU implementation:**
+### GPU search (auto-detect)
+
+./target/release/words-breaker 1At7z8J3t3JJiAqtBTyJuHdCMKx45HmyVp --tokenlist tokenlist.txt --min-token 3 --cpu
+
+
+### Fixed slot & word order (no permutations)
+
 ```bash
-./target/release/words-breaker --selftest
+./target/release/words-breaker 1At7z8J3t3JJiAqtBTyJuHdCMKx45HmyVp --tokenlist tokenlist.txt --min-token 3 --cpu --keep-token-order
+  --keep-word-order
 ```
 
-**With Portuguese wordlist:**
+
+### Non-English wordlist
+
 ```bash
-./target/release/words-breaker 1CfntEjWHwCc7moXnMHUX8QuBJaakAnv8U bexiga bonde curativo nevoeiro mundial vareta urubu megafone cozinha livro surpresa senador -l portuguese
+./target/release/words-breaker 1At7z8J3t3JJiAqtBTyJuHdCMKx45HmyVp --tokenlist tokenlist.txt --min-token 3 --cpu
+  --language spanish
 ```
+---
 
 ## How It Works
 
-1. Streams permutations of the provided words (completing missing words when 10/11
-   are given), as compact 12-index arrays — nothing is held fully in memory
-2. On the GPU, each candidate is checksum-filtered, then survivors are derived:
-   PBKDF2-HMAC-SHA512 seed → BIP32 `m/44'/0'/0'/0/0` → secp256k1 public key →
-   `RIPEMD160(SHA256(pubkey))`
-3. The resulting hash160 is compared against the target address's hash160
-4. Stops and outputs the correct phrase when a match is found
+```
+Tokenlist File
+     │
+     ▼
+Parse Slots & Alternatives
+     │
+     ▼
+Expand Wildcards (?)  ──────────────────────────────┐
+     │                                               │
+     ▼                                               │
+Generate Permutations                          BIP-39 Wordlist
+(slot order + word order)                     (2048 words × lang)
+     │
+     ▼
+Filter: must be exactly 12 words
+     │
+     ├──── CPU Mode ──── Rayon parallel_iter ─────────┐
+     │                                                 │
+     └──── GPU Mode ──── CUDA batch kernel ────────────┤
+                                                       │
+                                                       ▼
+                                          BIP-39 → Seed → Master Xpriv
+                                          → m/44'/0'/0'/0/0
+                                          → P2PKH Address
+                                                       │
+                                                       ▼
+                                            Compare with Target
+                                                       │
+                                                  Match found!
+```
 
-## Performance Notes
+### Derivation Path
 
-- 12 words have 479,001,600 (12!) possible permutations; supplying 10 or 11 words
-  multiplies this by up to 2048 per missing word
-- The whole space is streamed and searched (there is no fixed permutation cap)
-- The dominant cost per candidate is PBKDF2-HMAC-SHA512 (2048 iterations), which is
-  fixed by the BIP-39 spec; the GPU runs many candidates in parallel
-- Invalid BIP-39 checksums are filtered out cheaply before the expensive work
+All addresses are derived using the standard BIP-44 path:
+
+```
+m / 44' / 0' / 0' / 0 / 0
+```
+
+---
+
+## Performance
+
+| Mode | Typical Speed | Notes |
+|------|--------------|-------|
+| CPU (single core) | ~500–2K phrases/sec | Depends on phrase complexity |
+| CPU (multi-core) | ~4K–20K phrases/sec | Scales linearly with cores |
+| GPU (CUDA) | ~1M+ phrases/sec | Requires NVIDIA GPU with CUDA |
+
+> GPU mode sends the full candidate batch at once per slot combination for maximum throughput.
+
+---
+
+## Supported Languages
+
+| Language | Flag |
+|----------|------|
+| `english` | 🇬🇧 |
+| `spanish` | 🇪🇸 |
+| `portuguese` | 🇵🇹 |
+| `french` | 🇫🇷 |
+| `italian` | 🇮🇹 |
+| `czech` | 🇨🇿 |
+| `korean` | 🇰🇷 |
+| `japanese` | 🇯🇵 |
+| `chinese-simplified` | 🇨🇳 |
+| `chinese-traditional` | 🇹🇼 |
+
+---
+
+## Troubleshooting
+
+**`GPU unavailable; falling back to CPU`**
+CUDA toolkit is not installed or the binary was not built with `--features cuda`. Install the [NVIDIA CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit) and rebuild.
+
+**`is not in the BIP-39 wordlist`**
+One of the words in your tokenlist is not a valid BIP-39 word. Check spelling — all words must match the official BIP-39 wordlist exactly.
+
+**`Only mainnet legacy addresses are supported`**
+The tool only supports mainnet P2PKH addresses (starting with `1`). Segwit (`3...`, `bc1...`) addresses are not supported.
+
+**`Total word count must equal 12`**
+The combined word count across all chosen slots must be exactly 12. Adjust your tokenlist or use `--min-token` to select fewer slots.
+
+---
+
+## Disclaimer
+
+> ⚠️ **This tool is intended solely for recovering access to your own Bitcoin wallet.**
+> Using it to attempt unauthorized access to wallets you do not own is illegal and unethical.
+> The authors accept no responsibility for misuse.
+
+---
 
 ## License
 
-MIT
+MIT © 2024
