@@ -73,7 +73,7 @@ The binary will be at `target/release/word-breaker`.
 ## Usage
 
 ```
-./target/release/words-breaker 1JKQKyPXm42BPQfu2pevNzT1ej5KBcdaHS --tokenlist tokenlist.txt --min-token 3 --keep-word-order --keep-token-order
+./target/release/words-breaker 1JKQKyPXm42BPQfu2pevNzT1ej5KBcdaHS --tokenlist tokenlist.txt --min-token 3 --keep-word-order --keep-token-order --max-batch 16
 ```
 
 
